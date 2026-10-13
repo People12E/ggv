@@ -1,0 +1,262 @@
+// Minimal stand-in for Apple's <metal_stdlib>, ONLY for syntax/type-checking .metal sources with
+// clang++ on machines that have no Metal compiler (see tools/check_msl.py). It is not a Metal
+// implementation: it type-checks, it does not run. Real validation is still the Xcode build.
+#pragma once
+#include <cmath>
+#include <cfloat>
+#include <cstdint>
+#include <cstring>
+#include <type_traits>
+#include <utility>
+
+typedef unsigned int uint;
+typedef unsigned char uchar;
+typedef unsigned short ushort;
+typedef _Float16 half;
+
+#ifndef M_PI_F
+#define M_PI_F 3.14159265358979323846f
+#define M_PI_2_F 1.57079632679489661923f
+#define M_PI_4_F 0.78539816339744830962f
+#define M_1_PI_F 0.31830988618379067154f
+#define M_2_PI_F 0.63661977236758134308f
+#define M_E_F 2.71828182845904523536f
+#endif
+#ifndef MAXFLOAT
+#define MAXFLOAT FLT_MAX
+#endif
+
+namespace metal {
+
+// ---------------------------------------------------------------- vectors
+template <typename T> struct vtr { using S = T; static constexpr int n = 1; };
+#define BP_VEC(T, N)                                                          \
+    typedef T T##N __attribute__((ext_vector_type(N)));                       \
+    template <> struct vtr<T##N> { using S = T; static constexpr int n = N; };
+#define BP_VEC3(T) BP_VEC(T, 2) BP_VEC(T, 3) BP_VEC(T, 4)
+BP_VEC3(float) BP_VEC3(half) BP_VEC3(int) BP_VEC3(uint)
+BP_VEC3(short) BP_VEC3(ushort) BP_VEC3(char) BP_VEC3(uchar)
+// Comparisons on ext vectors yield same-width signed int vectors, so bool vectors are int vectors here.
+typedef int2 bool2; typedef int3 bool3; typedef int4 bool4;
+
+// Constructor emulation: tools/check_msl.py rewrites `float4(...)` into `__mk<float4>(...)`.
+template <typename V, typename... A> inline V __mk(A... a) {
+    using S = typename vtr<V>::S;
+    constexpr int N = vtr<V>::n;
+    S tmp[32];
+    int k = 0;
+    auto push = [&](auto x) {
+        using X = decltype(x);
+        if constexpr (vtr<X>::n == 1) { tmp[k++] = (S)x; }
+        else { for (int i = 0; i < vtr<X>::n; ++i) tmp[k++] = (S)x[i]; }
+    };
+    (push(a), ...);
+    V r;
+    for (int i = 0; i < N; ++i) r[i] = (k == 1) ? tmp[0] : tmp[i];
+    return r;
+}
+
+template <typename T> inline auto __get(T x, int i) {
+    if constexpr (vtr<T>::n > 1) return x[i]; else return x;
+}
+template <typename A, typename B> struct cm {
+    using type = std::conditional_t<(vtr<A>::n > 1), A,
+                 std::conditional_t<(vtr<B>::n > 1), B, decltype(A{} + B{})>>;
+};
+template <typename V, typename F> inline V __lane1(V v, F f) {
+    if constexpr (vtr<V>::n == 1) return (V)f(v);
+    else { V r; for (int i = 0; i < vtr<V>::n; ++i) r[i] = f(v[i]); return r; }
+}
+template <typename A, typename B, typename F> inline auto __lane2(A a, B b, F f) {
+    using R = typename cm<A, B>::type;
+    if constexpr (vtr<R>::n == 1) return (R)f((R)a, (R)b);
+    else { R r; for (int i = 0; i < vtr<R>::n; ++i) r[i] = f(__get(a, i), __get(b, i)); return r; }
+}
+template <typename A, typename B, typename C, typename F> inline auto __lane3(A a, B b, C c, F f) {
+    using R = typename cm<typename cm<A, B>::type, C>::type;
+    if constexpr (vtr<R>::n == 1) return (R)f((R)a, (R)b, (R)c);
+    else { R r; for (int i = 0; i < vtr<R>::n; ++i) r[i] = f(__get(a, i), __get(b, i), __get(c, i)); return r; }
+}
+
+#define BP_F1(name, fn) template <typename T> inline T name(T x) { return __lane1(x, [](auto v) { return (decltype(v))fn((float)v); }); }
+BP_F1(sin, ::sinf) BP_F1(cos, ::cosf) BP_F1(tan, ::tanf) BP_F1(asin, ::asinf) BP_F1(acos, ::acosf)
+BP_F1(atan, ::atanf) BP_F1(sinh, ::sinhf) BP_F1(cosh, ::coshf) BP_F1(tanh, ::tanhf)
+BP_F1(exp, ::expf) BP_F1(exp2, ::exp2f) BP_F1(log, ::logf) BP_F1(log2, ::log2f) BP_F1(log10, ::log10f)
+BP_F1(sqrt, ::sqrtf) BP_F1(floor, ::floorf) BP_F1(ceil, ::ceilf) BP_F1(round, ::roundf)
+BP_F1(trunc, ::truncf) BP_F1(rint, ::rintf)
+template <typename T> inline T rsqrt(T x) { return __lane1(x, [](auto v) { return (decltype(v))(1.0f / ::sqrtf((float)v)); }); }
+template <typename T> inline T fract(T x) { return x - floor(x); }
+template <typename T> inline T saturate(T x) { return __lane1(x, [](auto v) { return v < 0 ? (decltype(v))0 : (v > 1 ? (decltype(v))1 : v); }); }
+template <typename T> inline T abs(T x) { return __lane1(x, [](auto v) { return v < 0 ? -v : v; }); }
+template <typename T> inline T fabs(T x) { return abs(x); }
+template <typename T> inline T sign(T x) { return __lane1(x, [](auto v) { return (decltype(v))(v > 0 ? 1 : (v < 0 ? -1 : 0)); }); }
+template <typename T> inline T radians(T x) { return x * 0.017453292519943295f; }
+template <typename T> inline T degrees(T x) { return x * 57.29577951308232f; }
+
+template <typename A, typename B> inline auto min(A a, B b) { return __lane2(a, b, [](auto x, auto y) { return y < x ? y : x; }); }
+template <typename A, typename B> inline auto max(A a, B b) { return __lane2(a, b, [](auto x, auto y) { return x < y ? y : x; }); }
+template <typename A, typename B> inline auto pow(A a, B b) { return __lane2(a, b, [](auto x, auto y) { return (decltype(x))::powf((float)x, (float)y); }); }
+template <typename A, typename B> inline auto fmod(A a, B b) { return __lane2(a, b, [](auto x, auto y) { return (decltype(x))::fmodf((float)x, (float)y); }); }
+template <typename A, typename B> inline auto atan2(A a, B b) { return __lane2(a, b, [](auto x, auto y) { return (decltype(x))::atan2f((float)x, (float)y); }); }
+template <typename A, typename B> inline auto copysign(A a, B b) { return __lane2(a, b, [](auto x, auto y) { return (decltype(x))::copysignf((float)x, (float)y); }); }
+template <typename A, typename B> inline auto step(A edge, B x) { return __lane2(edge, x, [](auto e, auto v) { return (decltype(v))(v < e ? 0 : 1); }); }
+template <typename A, typename B, typename C> inline auto clamp(A x, B lo, C hi) { return __lane3(x, lo, hi, [](auto v, auto l, auto h) { return v < l ? l : (v > h ? h : v); }); }
+template <typename A, typename B, typename C> inline auto mix(A a, B b, C t) { return __lane3(a, b, t, [](auto x, auto y, auto k) { return x + (y - x) * k; }); }
+template <typename A, typename B, typename C> inline auto fma(A a, B b, C c) { return __lane3(a, b, c, [](auto x, auto y, auto z) { return x * y + z; }); }
+template <typename A, typename B, typename C> inline auto smoothstep(A e0, B e1, C x) {
+    return __lane3(e0, e1, x, [](auto a, auto b, auto v) {
+        auto t = (v - a) / (b - a); t = t < 0 ? 0 : (t > 1 ? 1 : t); return t * t * (3 - 2 * t); });
+}
+
+template <typename V> inline auto dot(V a, V b) {
+    using S = typename vtr<V>::S;
+    if constexpr (vtr<V>::n == 1) return a * b;
+    else { S s = 0; for (int i = 0; i < vtr<V>::n; ++i) s += a[i] * b[i]; return s; }
+}
+template <typename V> inline auto length(V v) { if constexpr (vtr<V>::n == 1) return abs(v); else return sqrt(dot(v, v)); }
+template <typename V> inline auto distance(V a, V b) { return length(a - b); }
+template <typename V> inline V normalize(V v) { return v / length(v); }
+template <typename V> inline V reflect(V i, V n) { return i - 2 * dot(n, i) * n; }
+template <typename V, typename E> inline V refract(V i, V n, E eta) {
+    auto d = dot(n, i); auto k = 1 - eta * eta * (1 - d * d);
+    if (k < 0) return V(0);
+    return eta * i - (eta * d + sqrt(k)) * n;
+}
+inline float3 cross(float3 a, float3 b) { return float3{a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; }
+
+template <typename V> inline bool all(V v) {
+    if constexpr (vtr<V>::n == 1) return v != 0; else { for (int i = 0; i < vtr<V>::n; ++i) if (!v[i]) return false; return true; }
+}
+template <typename V> inline bool any(V v) {
+    if constexpr (vtr<V>::n == 1) return v != 0; else { for (int i = 0; i < vtr<V>::n; ++i) if (v[i]) return true; return false; }
+}
+template <int N> struct ivec;
+template <> struct ivec<2> { using t = int2; };
+template <> struct ivec<3> { using t = int3; };
+template <> struct ivec<4> { using t = int4; };
+template <typename V> inline auto isnan(V v) {
+    if constexpr (vtr<V>::n == 1) return __builtin_isnan((float)v);
+    else { typename ivec<vtr<V>::n>::t r; for (int i = 0; i < vtr<V>::n; ++i) r[i] = __builtin_isnan((float)v[i]) ? -1 : 0; return r; }
+}
+template <typename V> inline auto isinf(V v) {
+    if constexpr (vtr<V>::n == 1) return __builtin_isinf((float)v);
+    else { typename ivec<vtr<V>::n>::t r; for (int i = 0; i < vtr<V>::n; ++i) r[i] = __builtin_isinf((float)v[i]) ? -1 : 0; return r; }
+}
+template <typename V> inline auto isfinite(V v) {
+    if constexpr (vtr<V>::n == 1) return __builtin_isfinite((float)v);
+    else { typename ivec<vtr<V>::n>::t r; for (int i = 0; i < vtr<V>::n; ++i) r[i] = __builtin_isfinite((float)v[i]) ? -1 : 0; return r; }
+}
+template <typename T, typename C> inline T select(T a, T b, C c) {
+    if constexpr (vtr<C>::n == 1) return c ? b : a;
+    else { T r; for (int i = 0; i < vtr<T>::n; ++i) r[i] = c[i] ? b[i] : a[i]; return r; }
+}
+template <typename To, typename From> inline To as_type(From f) { return __builtin_bit_cast(To, f); }
+inline uint popcount(uint x) { return __builtin_popcount(x); }
+inline uint clz(uint x) { return x ? __builtin_clz(x) : 32; }
+inline uint ctz(uint x) { return x ? __builtin_ctz(x) : 32; }
+inline uint rotate(uint x, uint s) { s &= 31; return s ? (x << s) | (x >> (32 - s)) : x; }
+inline uint mulhi(uint a, uint b) { return (uint)(((unsigned long long)a * b) >> 32); }
+template <typename T> inline T min3(T a, T b, T c) { return min(a, min(b, c)); }
+template <typename T> inline T max3(T a, T b, T c) { return max(a, max(b, c)); }
+template <typename T> inline T median3(T a, T b, T c) { return max(min(a, b), min(max(a, b), c)); }
+
+// ---------------------------------------------------------------- matrices (column-major)
+#define BP_MAT(C, R)                                                                          \
+    struct float##C##x##R {                                                                   \
+        float##R col[C];                                                                      \
+        float##C##x##R() { for (int i = 0; i < C; ++i) col[i] = float##R(0); }                \
+        explicit float##C##x##R(float d) { for (int i = 0; i < C; ++i) { col[i] = float##R(0); if (i < R) col[i][i] = d; } } \
+        template <typename... A, typename = std::enable_if_t<sizeof...(A) == C>>              \
+        float##C##x##R(A... a) { int k = 0; ((col[k++] = a), ...); }                          \
+        float##R& operator[](int i) { return col[i]; }                                        \
+        const float##R& operator[](int i) const { return col[i]; }                            \
+    };                                                                                        \
+    inline float##R operator*(const float##C##x##R& m, float##C v) {                          \
+        float##R r = float##R(0); for (int i = 0; i < C; ++i) r += m.col[i] * v[i]; return r; }
+BP_MAT(2, 2) BP_MAT(3, 3) BP_MAT(4, 4) BP_MAT(3, 4) BP_MAT(4, 3)
+inline float3x3 operator*(const float3x3& a, const float3x3& b) { float3x3 r; for (int i = 0; i < 3; ++i) r[i] = a * b[i]; return r; }
+inline float4x4 operator*(const float4x4& a, const float4x4& b) { float4x4 r; for (int i = 0; i < 4; ++i) r[i] = a * b[i]; return r; }
+inline float3x3 transpose(const float3x3& m) { float3x3 r; for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) r[i][j] = m[j][i]; return r; }
+inline float4x4 transpose(const float4x4& m) { float4x4 r; for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) r[i][j] = m[j][i]; return r; }
+inline float determinant(const float3x3& m) { return dot(m[0], cross(m[1], m[2])); }
+
+// ---------------------------------------------------------------- textures / samplers
+enum access { sample, read, write, read_write };
+namespace coord { enum c { normalized, pixel }; }
+namespace address { enum a { clamp_to_edge, clamp_to_zero, clamp_to_border, repeat, mirrored_repeat }; }
+namespace filter { enum f { nearest, linear }; }
+namespace mip_filter { enum m { none, nearest, linear }; }
+namespace mag_filter { enum m { nearest, linear }; }
+namespace min_filter { enum m { nearest, linear }; }
+namespace compare_func { enum c { never, less, less_equal, greater, greater_equal, equal, not_equal, always }; }
+namespace border_color { enum b { transparent_black, opaque_black, opaque_white }; }
+struct sampler { template <typename... A> constexpr sampler(A...) {} };
+struct __lod {};
+inline __lod level(float) { return {}; }
+inline __lod bias(float) { return {}; }
+inline __lod gradient2d(float2, float2) { return {}; }
+template <typename T> struct v4 { using t = float4; };
+template <> struct v4<half> { using t = half4; };
+template <> struct v4<int> { using t = int4; };
+template <> struct v4<uint> { using t = uint4; };
+template <> struct v4<short> { using t = short4; };
+template <> struct v4<ushort> { using t = ushort4; };
+
+template <typename T, access A = access::sample> struct texture2d {
+    using V = typename v4<T>::t;
+    uint get_width(uint = 0) const { return 1; }
+    uint get_height(uint = 0) const { return 1; }
+    uint get_num_mip_levels() const { return 1; }
+    template <typename... X> V sample(sampler, float2, X...) const { return V{}; }
+    template <typename... X> V gather(sampler, float2, X...) const { return V{}; }
+    template <typename P> V read(P, uint = 0) const { return V{}; }
+    template <typename P> void write(V, P, uint = 0) const {}
+};
+template <typename T, access A = access::sample> struct texture3d {
+    using V = typename v4<T>::t;
+    uint get_width(uint = 0) const { return 1; }
+    uint get_height(uint = 0) const { return 1; }
+    uint get_depth(uint = 0) const { return 1; }
+    template <typename... X> V sample(sampler, float3, X...) const { return V{}; }
+    template <typename P> V read(P, uint = 0) const { return V{}; }
+    template <typename P> void write(V, P, uint = 0) const {}
+};
+template <typename T, access A = access::sample> struct texture2d_array {
+    using V = typename v4<T>::t;
+    uint get_width(uint = 0) const { return 1; }
+    uint get_height(uint = 0) const { return 1; }
+    template <typename... X> V sample(sampler, float2, uint, X...) const { return V{}; }
+    template <typename P> V read(P, uint, uint = 0) const { return V{}; }
+    template <typename P> void write(V, P, uint, uint = 0) const {}
+};
+template <typename T, access A = access::sample> struct depth2d {
+    uint get_width(uint = 0) const { return 1; }
+    uint get_height(uint = 0) const { return 1; }
+    template <typename... X> T sample(sampler, float2, X...) const { return T(0); }
+    template <typename... X> T sample_compare(sampler, float2, float, X...) const { return T(0); }
+    template <typename P> T read(P, uint = 0) const { return T(0); }
+};
+
+inline void discard_fragment() {}
+enum mem_flags { mem_none, mem_device, mem_threadgroup, mem_texture };
+inline void threadgroup_barrier(mem_flags) {}
+enum memory_order { memory_order_relaxed };
+struct atomic_uint { uint v; };
+struct atomic_int { int v; };
+inline uint atomic_fetch_add_explicit(atomic_uint* p, uint v, memory_order) { uint o = p->v; p->v += v; return o; }
+inline uint atomic_load_explicit(const atomic_uint* p, memory_order) { return p->v; }
+inline void atomic_store_explicit(atomic_uint* p, uint v, memory_order) { p->v = v; }
+
+namespace fast { using namespace metal; }
+namespace precise { using namespace metal; }
+}  // namespace metal
+
+// Address spaces and function qualifiers vanish; resource attributes are ignored by clang
+// (check_msl.py passes -Wno-unknown-attributes).
+#define device
+#define constant
+#define thread
+#define threadgroup
+#define kernel
+#define vertex
+#define fragment
